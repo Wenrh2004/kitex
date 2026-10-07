@@ -318,7 +318,11 @@ func (kc *kClient) initMiddlewares(ctx context.Context) (mw middleware) {
 		// integrate xds if enabled
 		mw.uMws = append(mw.uMws, kc.opt.XDSRouterMiddleware.ToUnaryMiddleware())
 	}
-	mw.uMws = append(mw.uMws, rpcTimeoutMW(ctx))
+	var taskService string
+	if kc.opt.TaskObserver != nil && kc.opt.Svr != nil {
+		taskService = kc.opt.Svr.ServiceName
+	}
+	mw.uMws = append(mw.uMws, rpcTimeoutMWWithObserver(ctx, kc.opt.TaskObserver, taskService))
 	kc.opt.UnaryOptions.InitMiddlewares(ctx)
 	mw.uMws = append(mw.uMws, kc.opt.UnaryOptions.UnaryMiddlewares...)
 

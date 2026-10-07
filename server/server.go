@@ -47,6 +47,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/pkg/streaming"
+	"github.com/cloudwego/kitex/pkg/taskstats"
 )
 
 // Server is an abstraction of an RPC server. It accepts connections and dispatches them to the service
@@ -355,6 +356,9 @@ func (s *server) invokeHandleEndpoint() endpoint.UnaryEndpoint {
 		if methodName == "" && svcInfo.ServiceName != serviceinfo.GenericService {
 			return errors.New("method name is empty in rpcinfo, should not happen")
 		}
+		task := taskstats.Begin(s.opt.TaskObserver, taskstats.Meta{
+			Executor: "kitex.server.handler", Type: "inline", Role: "server", Service: svcInfo.ServiceName,
+		})
 		defer func() {
 			if handlerErr := recover(); handlerErr != nil {
 				err = kerrors.ErrPanic.WithCauseAndStack(
@@ -373,7 +377,17 @@ func (s *server) invokeHandleEndpoint() endpoint.UnaryEndpoint {
 		rpcinfo.Record(ctx, ri, stats.ServerHandleStart, nil)
 		// set session
 		backup.BackupCtx(ctx)
-		err = implHandlerFunc(ctx, svc.getHandler(methodName), args, resp)
+		if task == nil {
+			err = implHandlerFunc(ctx, svc.getHandler(methodName), args, resp)
+		} else {
+			task.RunOutcome(func() taskstats.Outcome {
+				err = implHandlerFunc(ctx, svc.getHandler(methodName), args, resp)
+				if err != nil {
+					return taskstats.OutcomeError
+				}
+				return taskstats.OutcomeSuccess
+			})
+		}
 		if err != nil {
 			if bizErr, ok := kerrors.FromBizStatusError(err); ok {
 				if setter, ok := ri.Invocation().(rpcinfo.InvocationSetter); ok {
@@ -398,6 +412,9 @@ func (s *server) streamHandleEndpoint() sep.StreamEndpoint {
 		if methodName == "" && svcInfo.ServiceName != serviceinfo.GenericService {
 			return errors.New("method name is empty in rpcinfo, should not happen")
 		}
+		task := taskstats.Begin(s.opt.TaskObserver, taskstats.Meta{
+			Executor: "kitex.server.handler", Type: "inline", Role: "server", Service: svcInfo.ServiceName,
+		})
 		defer func() {
 			if handlerErr := recover(); handlerErr != nil {
 				err = kerrors.ErrPanic.WithCauseAndStack(
@@ -428,7 +445,17 @@ func (s *server) streamHandleEndpoint() sep.StreamEndpoint {
 				}
 			}
 		}
-		err = implHandlerFunc(ctx, svc.getHandler(methodName), args, nil)
+		if task == nil {
+			err = implHandlerFunc(ctx, svc.getHandler(methodName), args, nil)
+		} else {
+			task.RunOutcome(func() taskstats.Outcome {
+				err = implHandlerFunc(ctx, svc.getHandler(methodName), args, nil)
+				if err != nil {
+					return taskstats.OutcomeError
+				}
+				return taskstats.OutcomeSuccess
+			})
+		}
 		if err != nil {
 			if bizErr, ok := kerrors.FromBizStatusError(err); ok {
 				if setter, ok := ri.Invocation().(rpcinfo.InvocationSetter); ok {

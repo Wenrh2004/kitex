@@ -19,6 +19,8 @@ package nphttp2
 import (
 	"context"
 	"crypto/tls"
+	"errors"
+	"io"
 	"net"
 	"runtime"
 	"runtime/debug"
@@ -30,6 +32,7 @@ import (
 
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
+	"github.com/cloudwego/kitex/pkg/remote/connstats"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
@@ -48,8 +51,14 @@ func poolSize() uint32 {
 	return uint32(numP * 3 / 2)
 }
 
+// nextConnectionPoolID is only advanced for pools with observation enabled.
+var nextConnectionPoolID uint64
+
 // NewConnPool ...
 func NewConnPool(remoteService string, size uint32, connOpts grpc.ConnectOptions) *connPool {
+	if connOpts.ConnectionObserver != nil {
+		connOpts.ConnectionPoolID = atomic.AddUint64(&nextConnectionPoolID, 1)
+	}
 	if connOpts.TraceController == nil {
 		connOpts.TraceController = &rpcinfo.TraceController{}
 	}
@@ -129,9 +138,9 @@ func (p *connPool) Get(ctx context.Context, network, address string, opt remote.
 			isNew = true
 		}
 
-		res, cErr := trans.createTransport(idx, p.remoteService, opt.Dialer, network, address, opt.ConnectTimeout, p.connOpts)
+		res, cErr := trans.createTransportDeferred(idx, p.remoteService, opt.Dialer, network, address, opt.ConnectTimeout, p.connOpts)
 		if cErr != nil {
-			return nil, cErr
+			return res, cErr
 		}
 
 		if isNew {
@@ -141,20 +150,29 @@ func (p *connPool) Get(ctx context.Context, network, address string, opt remote.
 			p.conns.LoadOrStore(address, trans)
 			if p.isClosed() {
 				if recheckV, recheckOK := p.conns.LoadAndDelete(address); recheckOK {
-					recheckV.(*transports).close()
+					// Closing may publish observation. Finish it after releasing
+					// singleflight so reentrant callbacks cannot wait on this call.
+					res.closing = recheckV.(*transports)
 				}
-				return nil, errConnPoolClosed
+				return res, errConnPoolClosed
 			}
 		}
 
 		return res, nil
 	})
+	creation, _ := rawTr.(*transportCreation)
+	creation.finish(true)
 	if dErr != nil {
 		klog.CtxErrorf(ctx, "KITEX: New grpc client connection failed, network=%s, address=%s, error=%s", network, address, dErr.Error())
 		return nil, dErr
 	}
+	// A factory may close the pool reentrantly after the entry is published.
+	// Preserve the pool-close error and never create a stream on that transport.
+	if p.isClosed() {
+		return nil, errConnPoolClosed
+	}
 	klog.CtxDebugf(ctx, "KITEX: New grpc client connection succeed, network=%s, address=%s", network, address)
-	return newClientConn(ctx, rawTr.(grpc.ClientTransport), address)
+	return newClientConn(ctx, creation.transport, address)
 }
 
 // Put implements the ConnPool interface.
@@ -176,7 +194,16 @@ func (p *connPool) createShortConn(ctx context.Context, network, address string,
 	if err != nil {
 		return nil, err
 	}
-	return newClientConn(ctx, tr, address)
+	activateConnectionObserver(tr)
+	conn, err := newClientConn(ctx, tr, address)
+	if err != nil {
+		// Short connections are owned exclusively by this call and never enter
+		// the pool. No caller can release the transport when stream creation
+		// fails, so release it here before returning the original error.
+		_ = tr.Close(err)
+		return nil, err
+	}
+	return conn, nil
 }
 
 // Discard implements the ConnPool interface.
@@ -268,9 +295,32 @@ func newTransport(remoteService string,
 	onGoAway func(context.Context, grpc.ClientTransport, grpc.GoAwayReason),
 	onClose func(context.Context, grpc.ClientTransport, error),
 ) (grpc.ClientTransport, error) {
+	tr, observation, err := newTransportWithDialObservation(remoteService, dialer, network, address, connectTimeout, opts, onGoAway, onClose)
+	observation.publish()
+	return tr, err
+}
+
+// The caller owning a slot lock defers delivery until after unlocking. Dial
+// tracking describes only real attempts, never reuse or pool rejection.
+func newTransportWithDialObservation(remoteService string,
+	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
+	onGoAway func(context.Context, grpc.ClientTransport, grpc.GoAwayReason),
+	onClose func(context.Context, grpc.ClientTransport, error),
+) (tr grpc.ClientTransport, observation *transportDialObservation, err error) {
+	mode := connstats.ModeLong
+	if opts.ShortConn {
+		mode = connstats.ModeShort
+	}
+	meta := connstats.Meta{Service: remoteService, Target: address, Mode: mode, PoolID: opts.ConnectionPoolID}
+	if observer, ok := opts.ConnectionObserver.(connstats.DialObserver); ok {
+		observation = &transportDialObservation{observer: observer, meta: meta}
+		started := time.Now()
+		defer func() { observation.event.Duration = time.Since(started) }()
+	}
 	conn, err := dialer.DialTimeout(network, address, connectTimeout)
 	if err != nil {
-		return nil, err
+		observation.failed(connstats.DialFailed, err)
+		return nil, observation, err
 	}
 	if opts.TLSConfig != nil {
 		tlsConn, tErr := newTLSConn(conn, opts.TLSConfig)
@@ -280,20 +330,88 @@ func newTransport(remoteService string,
 			if cErr != nil {
 				klog.Warnf("KITEX: Close TLS handshake failed connection, err: %v", cErr)
 			}
-			return nil, tErr
+			observation.failed(connstats.DialTLSFailed, tErr)
+			return nil, observation, tErr
 		}
 		conn = tlsConn
 	}
-	return grpc.NewClientTransportWithConfig(
+	tr, err = grpc.NewClientTransportWithConfig(
 		context.Background(), // gRPC connection does not need to be bound to a specific ctx
 		conn,
 		opts,
 		grpc.ClientConfig{
-			RemoteService: remoteService,
-			OnGoAway:      onGoAway,
-			OnClose:       onClose,
+			RemoteService:  remoteService,
+			OnGoAway:       onGoAway,
+			OnClose:        onClose,
+			ConnectionMeta: meta,
 		},
 	)
+	if err != nil {
+		observation.failed(connstats.DialTransportFailed, err)
+	}
+	return tr, observation, err
+}
+
+type transportDialObservation struct {
+	observer connstats.DialObserver
+	meta     connstats.Meta
+	event    connstats.DialEvent
+}
+
+var dialObserverLastWarning atomic.Int64
+
+func (o *transportDialObservation) failed(outcome connstats.DialOutcome, err error) {
+	if o == nil {
+		return
+	}
+	o.event.Outcome = outcome
+	if connectionErr, ok := err.(grpc.ConnectionError); ok {
+		err = connectionErr.Origin()
+	}
+	switch {
+	case errors.Is(err, context.Canceled):
+		o.event.Reason = connstats.ReasonCanceled
+	case errors.Is(err, context.DeadlineExceeded):
+		o.event.Reason = connstats.ReasonDeadline
+	case errors.Is(err, io.EOF), errors.Is(err, io.ErrClosedPipe), errors.Is(err, net.ErrClosed):
+		o.event.Reason = connstats.ReasonNetwork
+	default:
+		var networkError net.Error
+		if errors.As(err, &networkError) {
+			o.event.Reason = connstats.ReasonNetwork
+			if networkError.Timeout() {
+				o.event.Reason = connstats.ReasonDeadline
+			}
+		} else if outcome == connstats.DialTLSFailed || outcome == connstats.DialTransportFailed {
+			o.event.Reason = connstats.ReasonProtocol
+		} else {
+			o.event.Reason = connstats.ReasonOther
+		}
+	}
+}
+
+func (o *transportDialObservation) publish() {
+	if o == nil {
+		return
+	}
+	defer func() {
+		if recovered := recover(); recovered != nil {
+			now := time.Now().UnixNano()
+			previous := dialObserverLastWarning.Load()
+			if (previous == 0 || now-previous >= int64(time.Minute)) && dialObserverLastWarning.CompareAndSwap(previous, now) {
+				klog.Warnf("KITEX: gRPC connection observer ObserveDial panic (warnings limited to once per minute): %v", recovered)
+			}
+		}
+	}()
+	o.observer.ObserveDial(o.meta, o.event)
+}
+
+// activateConnectionObserver must run after releasing transport creation locks.
+// Optional capability keeps existing ClientTransport implementations compatible.
+func activateConnectionObserver(tr grpc.ClientTransport) {
+	if activator, ok := tr.(grpc.ConnectionObserverActivator); ok {
+		activator.ActivateConnectionObserver()
+	}
 }
 
 // newTLSConn constructs a client-side TLS connection and performs handshake.

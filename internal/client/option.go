@@ -50,6 +50,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
 	"github.com/cloudwego/kitex/pkg/stats"
 	"github.com/cloudwego/kitex/pkg/streaming"
+	"github.com/cloudwego/kitex/pkg/taskstats"
 	"github.com/cloudwego/kitex/pkg/transmeta"
 	"github.com/cloudwego/kitex/pkg/utils"
 	"github.com/cloudwego/kitex/pkg/warmup"
@@ -183,8 +184,9 @@ type Options struct {
 	DebugService diagnosis.Service
 
 	// Observability
-	TracerCtl  *rpcinfo.TraceController
-	StatsLevel *stats.Level
+	TaskObserver taskstats.Observer
+	TracerCtl    *rpcinfo.TraceController
+	StatsLevel   *stats.Level
 
 	CloseCallbacks []func() error
 	WarmUpOption   *warmup.ClientOption

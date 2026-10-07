@@ -41,6 +41,7 @@ import (
 
 	"github.com/cloudwego/kitex/pkg/gofunc"
 	"github.com/cloudwego/kitex/pkg/klog"
+	"github.com/cloudwego/kitex/pkg/remote/connstats"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc/grpcframe"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc/syscall"
@@ -122,6 +123,9 @@ type http2Client struct {
 	bufferPool *bufferPool
 
 	traceCtl *rpcinfo.TraceController
+
+	// Initialized before starting the reader; mutable fields are guarded by mu.
+	observation *connectionObservation
 }
 
 // newHTTP2Client constructs a connected ClientTransport to addr based on HTTP2
@@ -198,6 +202,7 @@ func newHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 		streamsQuotaAvailable: make(chan struct{}, 1),
 		bufferPool:            newBufferPool(),
 		traceCtl:              opts.TraceController,
+		observation:           newConnectionObservation(opts.ConnectionObserver, cfg.ConnectionMeta),
 	}
 	t.controlBuf = newControlBuffer(t.ctx.Done())
 	if opts.InitialWindowSize >= defaultWindowSize {
@@ -349,6 +354,7 @@ func (task *closeStreamTask) Tick() {
 		task.toCloseStreams[i] = nil
 	}
 	task.toCloseStreams = task.toCloseStreams[:0]
+	trans.publishStreamObservation()
 }
 
 type clientTransportDump struct {
@@ -513,6 +519,9 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Strea
 			// If it was already done, return.
 			return
 		}
+		// onOrphaned can run under controlBuf.mu. Update the absolute
+		// snapshot here but leave user delivery to lock-free publish sites.
+		t.observationStreamClosed()
 		// The stream was unprocessed by the server.
 		atomic.StoreUint32(&s.unprocessed, 1)
 		s.write(recvMsg{err: err})
@@ -548,12 +557,15 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Strea
 		wq:         s.wq,
 	}
 	firstTry := true
+	var quotaWait *quotaWaitObservation
+	defer func() { t.observationQuotaWaitEnded(quotaWait) }()
 	var ch chan struct{}
 	checkForStreamQuota := func(it interface{}) bool {
 		if t.streamQuota <= 0 { // Can go negative if server decreases it.
 			klog.CtxInfof(ctx, "KITEX: %s %s NewStream blocked due to concurrent streams limit, MaxConcurrentStreams is %d", callHdr.Host, callHdr.Method, t.maxConcurrentStreams)
 			if firstTry {
 				t.waitingStreams++
+				quotaWait = t.observationQuotaWaitStarted()
 			}
 			ch = t.streamsQuotaAvailable
 			return false
@@ -573,7 +585,12 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Strea
 			t.mu.Unlock()
 			return false
 		}
+		if quotaWait != nil && !quotaWait.completed {
+			// End quota timing at admission, before user stream/event hooks.
+			t.observation.completeQuotaWaitLocked(quotaWait, time.Now())
+		}
 		t.activeStreams[s.id] = s
+		t.observationStreamOpenedLocked()
 		t.mu.Unlock()
 		if t.streamQuota > 0 && t.waitingStreams > 0 {
 			select {
@@ -602,6 +619,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Strea
 		success, err := t.controlBuf.executeAndPut(func(it interface{}) bool {
 			return checkForHeaderListSize(it) && checkForStreamQuota(it)
 		}, hdr)
+		t.publishStreamObservation()
 		if err != nil {
 			return nil, err
 		}
@@ -649,6 +667,13 @@ func (t *http2Client) CloseStream(s *Stream, err error) {
 // before invoking closeStream, pls do not hold the t.mu
 // because accessing the controlbuf while holding t.mu will cause a deadlock.
 func (t *http2Client) closeStream(s *Stream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string) {
+	t.closeStreamWithoutObservation(s, err, rst, rstCode, st, mdata)
+	t.publishStreamObservation()
+}
+
+// Batch transport cleanup uses this variant and publishes only after every
+// affected stream has been notified. User hooks must not interrupt the batch.
+func (t *http2Client) closeStreamWithoutObservation(s *Stream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, mdata map[string][]string) {
 	if !t.casStreamDone(s) {
 		return
 	}
@@ -669,6 +694,7 @@ func (t *http2Client) casStreamDone(s *Stream) bool {
 
 // doCloseStream performs the actual stream cleanup. Caller must have won casStreamDone first.
 func (t *http2Client) doCloseStream(s *Stream, err error, rst bool, rstCode http2.ErrCode, st *status.Status, reuseSt bool, mdata map[string][]string) {
+	t.observationStreamClosed()
 	// status and trailers can be updated here without any synchronization because the stream goroutine will
 	// only read it after it sees an io.EOF error from read or write and we'll write those errors
 	// only after updating this.
@@ -736,6 +762,13 @@ func (t *http2Client) Close(err error) error {
 		return nil
 	}
 	t.state = closing
+	if o := t.observation; o != nil && o.metricsEnabled {
+		o.latest.CloseReason = connectionCloseReason(err)
+		if o.latest.GoAwayReceived != 0 {
+			o.latest.CloseReason = connstats.ReasonGoAway
+		}
+	}
+	t.observationTransitionLocked(connstats.StateClosed)
 	streams := t.activeStreams
 	t.activeStreams = nil
 	if t.kpDormant {
@@ -753,8 +786,11 @@ func (t *http2Client) Close(err error) error {
 
 	// Notify all active streams.
 	for _, s := range streams {
-		t.closeStream(s, err, false, http2.ErrCodeNo, status.New(codes.Unavailable, ErrConnClosing.Desc), nil)
+		t.closeStreamWithoutObservation(s, err, false, http2.ErrCodeNo, status.New(codes.Unavailable, ErrConnClosing.Desc), nil)
 	}
+	// Observation is synchronous user code. Resource cleanup must complete
+	// before publishing even if a custom recorder violates its promptness contract.
+	t.publishConnectionObservation()
 	return cErr
 }
 
@@ -771,6 +807,7 @@ func (t *http2Client) GracefulClose() {
 		return
 	}
 	t.state = draining
+	t.observationTransitionLocked(connstats.StateDraining)
 	active := len(t.activeStreams)
 	t.mu.Unlock()
 	if active == 0 {
@@ -778,6 +815,7 @@ func (t *http2Client) GracefulClose() {
 		return
 	}
 	t.controlBuf.put(&incomingGoAway{})
+	t.publishConnectionObservation()
 }
 
 // Write formats the data into HTTP2 data frame(s) and sends it out. The caller
@@ -986,6 +1024,7 @@ func (t *http2Client) handleSettings(f *grpcframe.SettingsFrame, isFirst bool) {
 			delta := int64(*maxStreams) - int64(t.maxConcurrentStreams)
 			t.maxConcurrentStreams = *maxStreams
 			t.streamQuota += delta
+			t.observationCapacity(*maxStreams)
 			if delta > 0 && t.waitingStreams > 0 {
 				close(t.streamsQuotaAvailable) // wake all of them up.
 				t.streamsQuotaAvailable = make(chan struct{}, 1)
@@ -999,6 +1038,7 @@ func (t *http2Client) handleSettings(f *grpcframe.SettingsFrame, isFirst bool) {
 		}
 		return true
 	}, sf)
+	t.publishStreamObservation()
 }
 
 func (t *http2Client) handlePing(f *http2.PingFrame) {
@@ -1040,6 +1080,7 @@ func (t *http2Client) handleGoAway(f *grpcframe.GoAwayFrame) {
 	// the GoAwayId. This way streams that were in-flight while the GoAway from
 	// server was being sent don't get killed.
 	var invokeOnGoAway bool
+	var notifyWriter bool
 	var goAwayReason GoAwayReason
 	select {
 	case <-t.goAway: // t.goAway has been closed (i.e.,multiple GoAways).
@@ -1053,10 +1094,11 @@ func (t *http2Client) handleGoAway(f *grpcframe.GoAwayFrame) {
 		t.setGoAwayReason(f)
 		goAwayReason = t.goAwayReason
 		close(t.goAway)
-		defer t.controlBuf.put(&incomingGoAway{}) // Defer as t.mu is currently held.
+		notifyWriter = true // Do not access controlBuf while t.mu is held.
 		if t.state != draining {
 			invokeOnGoAway = true
 			t.state = draining
+			t.observationTransitionLocked(connstats.StateDraining)
 		}
 	}
 	// All streams with IDs greater than the GoAwayId
@@ -1066,6 +1108,10 @@ func (t *http2Client) handleGoAway(f *grpcframe.GoAwayFrame) {
 		upperLimit = math.MaxUint32 // Kill all streams after the GoAway ID.
 	}
 	t.prevGoAwayID = id
+	if o := t.observation; o != nil && o.metricsEnabled {
+		o.latest.GoAwayReceived++
+		o.latest.Version++
+	}
 	active := len(t.activeStreams)
 	if active <= 0 {
 		t.mu.Unlock()
@@ -1093,13 +1139,19 @@ func (t *http2Client) handleGoAway(f *grpcframe.GoAwayFrame) {
 	if invokeOnGoAway {
 		t.onGoAway(t.ctx, t, goAwayReason)
 	}
-
 	// we should not access controlBuf with t.mu held since it will cause deadlock.
 	// Pls refer to checkForStreamQuota in NewStream, it gets the controlbuf.mu and
 	// wants to get the t.mu.
 	for _, stream := range unprocessedStream {
-		t.closeStream(stream, errStreamDrain, false, http2.ErrCodeNo, statusGoAway, nil)
+		t.closeStreamWithoutObservation(stream, errStreamDrain, false, http2.ErrCodeNo, statusGoAway, nil)
 	}
+	// Preserve the existing order: enqueue stream cleanup before notifying
+	// the writer about GOAWAY, and complete both before user observation.
+	if notifyWriter {
+		t.controlBuf.put(&incomingGoAway{})
+	}
+	t.publishStreamObservation()
+	t.publishConnectionObservation()
 }
 
 // setGoAwayReason sets the value of t.goAwayReason based

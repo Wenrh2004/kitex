@@ -69,6 +69,7 @@ func (t *transports) getActiveTransport() (grpc.ClientTransport, uint32) {
 	slot, idx := t.getNextTransportSlot()
 	trans := slot.load()
 	if checkActive(trans) {
+		activateConnectionObserver(trans)
 		return trans, idx
 	}
 	return nil, idx
@@ -78,8 +79,17 @@ func (t *transports) getActiveTransport() (grpc.ClientTransport, uint32) {
 func (t *transports) createTransport(idx uint32, remoteService string,
 	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
 ) (grpc.ClientTransport, error) {
-	slot := t.getTransportSlot(idx)
-	return slot.createTransport(remoteService, dialer, network, address, connectTimeout, opts)
+	creation, err := t.createTransportDeferred(idx, remoteService, dialer, network, address, connectTimeout, opts)
+	creation.finish(true)
+	return creationTransport(creation), err
+}
+
+// createTransportDeferred is the singleflight-safe entry point. Its caller
+// publishes the address before finishing observation outside singleflight.
+func (t *transports) createTransportDeferred(idx uint32, remoteService string,
+	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
+) (*transportCreation, error) {
+	return t.getTransportSlot(idx).createTransportDeferred(remoteService, dialer, network, address, connectTimeout, opts)
 }
 
 // loadAll returns a snapshot of all non-nil transports across all slots.
@@ -134,6 +144,15 @@ func (slot *transportSlot) createTransport(
 	remoteService string,
 	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
 ) (grpc.ClientTransport, error) {
+	creation, err := slot.createTransportDeferred(remoteService, dialer, network, address, connectTimeout, opts)
+	creation.finish(false)
+	return creationTransport(creation), err
+}
+
+func (slot *transportSlot) createTransportDeferred(
+	remoteService string,
+	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
+) (*transportCreation, error) {
 	slot.mu.Lock()
 	if slot.state == slotClosed {
 		slot.mu.Unlock()
@@ -143,10 +162,10 @@ func (slot *transportSlot) createTransport(
 	// Double-check: another goroutine may have filled this slot.
 	if ref := slot.ref.Load(); ref != nil && checkActive(ref.ct) {
 		slot.mu.Unlock()
-		return ref.ct, nil
+		return &transportCreation{transport: ref.ct}, nil
 	}
 
-	newTrans, err := newTransport(remoteService, dialer, network, address, connectTimeout, opts,
+	newTrans, dialObservation, err := newTransportWithDialObservation(remoteService, dialer, network, address, connectTimeout, opts,
 		func(ctx context.Context, trans grpc.ClientTransport, reason grpc.GoAwayReason) {
 			slot.removeTransport(trans)
 		},
@@ -156,17 +175,55 @@ func (slot *transportSlot) createTransport(
 	)
 	if err != nil {
 		slot.mu.Unlock()
-		return nil, err
+		return &transportCreation{dial: dialObservation}, err
 	}
 
 	oldRef := slot.ref.Swap(&transportRef{ct: newTrans})
 	slot.mu.Unlock()
+	return &transportCreation{transport: newTrans, dial: dialObservation, old: oldRef}, nil
+}
 
-	if oldRef != nil && oldRef.ct != nil {
-		oldRef.ct.GracefulClose()
+// transportCreation is shared by all callers of one completed singleflight.
+// No observer callback runs until finish, after that flight has been removed.
+type transportCreation struct {
+	transport grpc.ClientTransport
+	dial      *transportDialObservation
+	old       *transportRef
+	closing   *transports
+	claimed   uint32
+	cleaned   uint32
+}
+
+func creationTransport(creation *transportCreation) grpc.ClientTransport {
+	if creation == nil {
+		return nil
 	}
+	return creation.transport
+}
 
-	return newTrans, nil
+func (creation *transportCreation) finish(activate bool) {
+	if creation == nil {
+		return
+	}
+	// A slow observer must not make another caller wait on a sync.Once mutex.
+	// Activation has its own nonblocking claim and observes the latest state.
+	if atomic.CompareAndSwapUint32(&creation.claimed, 0, 1) {
+		if creation.closing != nil {
+			creation.closing.close()
+		}
+		if creation.old != nil && creation.old.ct != nil {
+			creation.old.ct.GracefulClose()
+		}
+		atomic.StoreUint32(&creation.cleaned, 1)
+		creation.dial.publish()
+	} else if atomic.LoadUint32(&creation.cleaned) == 0 {
+		// The claiming caller will activate after required cleanup. Do not
+		// publish early, and do not wait for a possibly slow callback.
+		return
+	}
+	if activate {
+		activateConnectionObserver(creation.transport)
+	}
 }
 
 // removeTransport atomically clears this slot if it currently holds the given transport.

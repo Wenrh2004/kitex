@@ -33,6 +33,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/proxy"
 	"github.com/cloudwego/kitex/pkg/remote"
+	"github.com/cloudwego/kitex/pkg/remote/connstats"
 	"github.com/cloudwego/kitex/pkg/remote/trans/netpoll"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
 	"github.com/cloudwego/kitex/pkg/retry"
@@ -231,6 +232,18 @@ func WithBoundHandler(h remote.BoundHandler) Option {
 		} else {
 			klog.Warnf("KITEX: BoundHandler already exists, BoundHandler=%v", h)
 		}
+	}}
+}
+
+// WithGRPCConnectionObserver observes successfully constructed gRPC client
+// transports, including draining transports until their logical close.
+// It is disabled by default; nil disables it. The last option takes effect.
+// An observer can be shared by multiple clients. Its lifecycle belongs to the
+// caller: closing a client may leave transports draining existing streams.
+func WithGRPCConnectionObserver(observer connstats.Observer) Option {
+	return Option{F: func(o *client.Options, di *utils.Slice) {
+		di.Push("WithGRPCConnectionObserver")
+		o.GRPCConnectOpts.ConnectionObserver = observer
 	}}
 }
 

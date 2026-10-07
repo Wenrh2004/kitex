@@ -25,6 +25,7 @@ import (
 
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/profiler"
+	"github.com/cloudwego/kitex/pkg/taskstats"
 )
 
 // GoTask is used to spawn a new task.
@@ -35,6 +36,13 @@ var GoFunc GoTask
 
 func init() {
 	GoFunc = func(ctx context.Context, f func()) {
+		if holder := defaultTaskObserver.Load(); holder != nil && !observationOwned(ctx) {
+			task := taskstats.Begin(holder.observer, taskstats.Meta{
+				Executor: "kitex.gofunc", Type: "pooled", Role: "global",
+			})
+			original := f
+			f = func() { task.Run(original) }
+		}
 		gopool.CtxGo(ctx, func() {
 			profiler.Tag(ctx)
 			f()
@@ -46,30 +54,66 @@ func init() {
 // RecoverGoFuncWithInfo is the go func with recover panic and service info.
 // It is used for panic defence and output key info for troubleshooting.
 func RecoverGoFuncWithInfo(ctx context.Context, task func(), info *Info) {
+	var observed *taskstats.Task
+	if holder := defaultTaskObserver.Load(); holder != nil {
+		// GoFunc is publicly replaceable. This helper does not assume that
+		// its actual dispatcher is the shared gopool.
+		observed = taskstats.Begin(holder.observer, taskstats.Meta{
+			Executor: "kitex.gofunc.recover", Type: "custom", Role: "global",
+		})
+		ctx = &observedContext{Context: ctx}
+	}
+	submitted := false
+	defer func() {
+		if !submitted {
+			observed.Finish(taskstats.OutcomeError)
+		}
+	}()
 	GoFunc(ctx, func() {
+		observed.Start()
+		outcome := taskstats.OutcomeAborted
 		defer func() {
-			if panicErr := recover(); panicErr != nil {
-				if info.RemoteService == "" {
-					info.RemoteService = "unknown"
-				}
-				if info.RemoteAddr == "" {
-					info.RemoteAddr = "unknown"
-				}
-				stack := string(debug.Stack())
-				klog.CtxErrorf(ctx, "KITEX: panic happened, remoteService=%s remoteAddress=%s error=%v\nstack=%s",
-					info.RemoteService, info.RemoteAddr, panicErr, stack)
-
-				phLock.RLock()
-				if panicHandler != nil {
-					panicHandler(info, panicErr, stack)
-				}
-				phLock.RUnlock()
-			}
+			observed.Finish(outcome)
 			infoPool.Put(info)
 		}()
-
-		task()
+		returned := false
+		var panicErr interface{}
+		var panicStack string
+		func() {
+			defer func() {
+				panicErr = recover()
+				if panicErr != nil {
+					panicStack = string(debug.Stack())
+				}
+			}()
+			task()
+			returned = true
+		}()
+		if returned {
+			outcome = taskstats.OutcomeSuccess
+			return
+		}
+		// Recovering panic(nil) also returns here on Go 1.20. Goexit does
+		// not return from the inner function and is reported as aborted.
+		outcome = taskstats.OutcomePanic
+		if panicErr != nil {
+			if info.RemoteService == "" {
+				info.RemoteService = "unknown"
+			}
+			if info.RemoteAddr == "" {
+				info.RemoteAddr = "unknown"
+			}
+			stack := panicStack
+			klog.CtxErrorf(ctx, "KITEX: panic happened, remoteService=%s remoteAddress=%s error=%v\nstack=%s",
+				info.RemoteService, info.RemoteAddr, panicErr, stack)
+			phLock.RLock()
+			if panicHandler != nil {
+				panicHandler(info, panicErr, stack)
+			}
+			phLock.RUnlock()
+		}
 	})
+	submitted = true
 }
 
 // SetPanicHandler is used to do something when panic happen, for example do metric report.

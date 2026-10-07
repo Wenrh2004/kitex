@@ -27,6 +27,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/endpoint"
 	"github.com/cloudwego/kitex/pkg/profiler"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
+	"github.com/cloudwego/kitex/pkg/taskstats"
 )
 
 // timeoutPool is a worker pool for task with timeout
@@ -137,16 +138,41 @@ func (p *timeoutPool) createWorker(t *timeoutTask) bool {
 func (p *timeoutPool) RunTask(ctx context.Context, timeout time.Duration,
 	req, resp any, ep endpoint.Endpoint,
 ) (context.Context, error) {
+	return p.runTask(ctx, timeout, req, resp, ep, nil, "")
+}
+
+func (p *timeoutPool) runTask(ctx context.Context, timeout time.Duration, req, resp any,
+	ep endpoint.Endpoint, observer taskstats.Observer, service string,
+) (context.Context, error) {
 	t := newTimeoutTask(ctx, timeout, req, resp, ep)
+	if observer != nil {
+		t.observationReady = make(chan struct{})
+		t.observationSubmitted = time.Now()
+	}
+	activate := func(overflow bool) {
+		if observer == nil {
+			return
+		}
+		meta := taskstats.Meta{Executor: "kitex.timeout.reuse", Type: "reusable", Role: "client", Service: service}
+		if overflow {
+			meta.Executor, meta.Type = "kitex.timeout.overflow", "native"
+		}
+		t.observation = taskstats.BeginAt(observer, meta, t.observationSubmitted)
+		close(t.observationReady)
+	}
 	select {
 	case p.tasks <- t:
+		activate(false)
 		return t.Wait()
 	default:
 	}
 	if !p.createWorker(t) {
+		activate(true)
 		// if created worker, t.Run() will be called in worker goroutine
 		// if NOT, we should go t.Run() here.
 		go t.Run()
+	} else {
+		activate(false)
 	}
 	return t.Wait()
 }
@@ -166,7 +192,10 @@ type timeoutTask struct {
 	req, resp any
 	ep        endpoint.Endpoint
 
-	err atomic.Value
+	err                  atomic.Value
+	observation          *taskstats.Task
+	observationReady     chan struct{}
+	observationSubmitted time.Time
 }
 
 func newTimeoutTask(ctx context.Context, timeout time.Duration,
@@ -193,6 +222,9 @@ func (t *timeoutTask) recycle() {
 	t.req, t.resp = nil, nil
 	t.ep = nil
 	t.err = atomic.Value{}
+	t.observation = nil
+	t.observationReady = nil
+	t.observationSubmitted = time.Time{}
 	poolTask.Put(t)
 }
 
@@ -202,41 +234,73 @@ func (t *timeoutTask) Cancel(err error) {
 
 // Run must be called in a separated goroutine
 func (t *timeoutTask) Run() {
+	if t.observationReady != nil {
+		<-t.observationReady
+	}
+	t.observation.Start()
+	outcome := taskstats.OutcomeAborted
 	defer func() {
-		if panicInfo := recover(); panicInfo != nil {
-			ri := rpcinfo.GetRPCInfo(t.ctx)
-			if ri != nil {
-				t.err.Store(rpcinfo.ClientPanicToErr(t.ctx, panicInfo, ri, true))
-			} else {
-				t.err.Store(fmt.Errorf("KITEX: panic without rpcinfo, error=%v\nstack=%s",
-					panicInfo, debug.Stack()))
-			}
+		var finished time.Time
+		if t.observation != nil {
+			finished = time.Now()
 		}
 		t.Cancel(context.Canceled)
+		if t.observation != nil {
+			// Caller classification precedes the terminal snapshot, while the
+			// actual endpoint exit timestamp is retained.
+			t.wg.Wait()
+			t.observation.FinishAt(outcome, finished)
+		}
 		t.recycle()
 	}()
-	var err error
-	if profiler.IsEnabled(t.ctx) {
-		profiler.Tag(t.ctx)
-		err = t.ep(t.ctx, t.req, t.resp)
-		profiler.Untag(t.ctx)
-	} else {
-		err = t.ep(t.ctx, t.req, t.resp)
-	}
-	if err != nil { // panic if store nil
-		t.err.Store(err)
+	func() {
+		defer func() {
+			if panicInfo := recover(); panicInfo != nil {
+				outcome = taskstats.OutcomePanic
+				ri := rpcinfo.GetRPCInfo(t.ctx)
+				if ri != nil {
+					t.err.Store(rpcinfo.ClientPanicToErr(t.ctx, panicInfo, ri, true))
+				} else {
+					t.err.Store(fmt.Errorf("KITEX: panic without rpcinfo, error=%v\nstack=%s",
+						panicInfo, debug.Stack()))
+				}
+			}
+		}()
+		var err error
+		if profiler.IsEnabled(t.ctx) {
+			profiler.Tag(t.ctx)
+			err = t.ep(t.ctx, t.req, t.resp)
+			profiler.Untag(t.ctx)
+		} else {
+			err = t.ep(t.ctx, t.req, t.resp)
+		}
+		outcome = taskstats.OutcomeSuccess
+		if err != nil { // panic if store nil
+			outcome = taskstats.OutcomeError
+			t.err.Store(err)
+		}
+	}()
+	if outcome == taskstats.OutcomeAborted {
+		// A recovered legacy panic(nil) returns from the inner function;
+		// runtime.Goexit continues defers without reaching this statement.
+		outcome = taskstats.OutcomePanic
 	}
 }
 
 // Wait waits Run finishes and returns result
-func (t *timeoutTask) Wait() (context.Context, error) {
-	defer t.wg.Done()
+func (t *timeoutTask) Wait() (returnedCtx context.Context, err error) {
+	var callerCause error
+	defer func() {
+		t.observation.CallerReturned(callerCause == context.DeadlineExceeded, callerCause == context.Canceled)
+		t.wg.Done()
+	}()
 	dl, ok := t.ctx.Deadline()
 	if !ok {
-		return t.waitNoTimeout()
+		return t.waitNoTimeoutObserved(&callerCause)
 	}
 	d := time.Until(dl)
 	if d < 0 {
+		callerCause = context.DeadlineExceeded
 		t.Cancel(context.DeadlineExceeded)
 		return t.ctx, t.ctx.Err()
 	}
@@ -251,14 +315,21 @@ func (t *timeoutTask) Wait() (context.Context, error) {
 		return t.ctx, nil
 
 	case <-t.ctx.Context.Done(): // parent done
-		t.Cancel(t.ctx.Context.Err())
+		callerCause = t.ctx.Context.Err()
+		t.Cancel(callerCause)
 	case <-tm.C: // timeout
-		t.Cancel(context.DeadlineExceeded)
+		callerCause = context.DeadlineExceeded
+		t.Cancel(callerCause)
 	}
 	return t.ctx, t.ctx.Err()
 }
 
 func (t *timeoutTask) waitNoTimeout() (context.Context, error) {
+	var cause error
+	return t.waitNoTimeoutObserved(&cause)
+}
+
+func (t *timeoutTask) waitNoTimeoutObserved(callerCause *error) (context.Context, error) {
 	select {
 	case <-t.ctx.Done(): // finished before parent done
 		v := t.err.Load()
@@ -268,7 +339,8 @@ func (t *timeoutTask) waitNoTimeout() (context.Context, error) {
 		return t.ctx, nil
 
 	case <-t.ctx.Context.Done(): // parent done
-		t.Cancel(t.ctx.Context.Err())
+		*callerCause = t.ctx.Context.Err()
+		t.Cancel(*callerCause)
 		return t.ctx, t.ctx.Err()
 	}
 }

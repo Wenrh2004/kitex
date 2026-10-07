@@ -27,6 +27,7 @@ import (
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/rpctimeout"
+	"github.com/cloudwego/kitex/pkg/taskstats"
 )
 
 // workerPool is used to reduce the timeout goroutine overhead.
@@ -82,6 +83,10 @@ func isBusinessTimeout(start time.Time, kitexTimeout time.Duration, actualDDL ti
 }
 
 func rpcTimeoutMW(mwCtx context.Context) endpoint.UnaryMiddleware {
+	return rpcTimeoutMWWithObserver(mwCtx, nil, "")
+}
+
+func rpcTimeoutMWWithObserver(mwCtx context.Context, observer taskstats.Observer, service string) endpoint.UnaryMiddleware {
 	var moreTimeout time.Duration
 	if v, ok := mwCtx.Value(rpctimeout.TimeoutAdjustKey).(*time.Duration); ok && v != nil {
 		moreTimeout = *v
@@ -120,7 +125,7 @@ func rpcTimeoutMW(mwCtx context.Context) endpoint.UnaryMiddleware {
 				return next(ctx, request, response)
 			}
 			start := time.Now()
-			ctx, err := workerPool.RunTask(ctx, tm, request, response, backgroundEP)
+			ctx, err := workerPool.runTask(ctx, tm, request, response, backgroundEP, observer, service)
 			if err == nil {
 				return nil
 			}

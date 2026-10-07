@@ -35,6 +35,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cloudwego/kitex/pkg/kerrors"
+	"github.com/cloudwego/kitex/pkg/remote/connstats"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/metadata"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/status"
@@ -651,6 +652,11 @@ type ConnectOptions struct {
 	TraceController *rpcinfo.TraceController
 	// ReuseWriteBufferConfig configures reusing write buffer for each connection.
 	ReuseWriteBufferConfig ReuseWriteBufferConfig
+	// ConnectionObserver optionally observes established logical transports.
+	// It is disabled by default and is independent of RPC tracing.
+	ConnectionObserver connstats.Observer
+	// ConnectionPoolID identifies the process-local owner of observed transports.
+	ConnectionPoolID uint64
 }
 
 // ClientConfig consists of all the helper configurations to establish a client transport.
@@ -658,6 +664,8 @@ type ClientConfig struct {
 	RemoteService string
 	OnGoAway      func(ctx context.Context, trans ClientTransport, reason GoAwayReason)
 	OnClose       func(ctx context.Context, trans ClientTransport, err error)
+	// ConnectionMeta is copied into the connection observer when activated.
+	ConnectionMeta connstats.Meta
 }
 
 // NewServerTransport creates a ServerTransport with conn or non-nil error
@@ -676,6 +684,8 @@ func NewServerTransport(ctx context.Context, conn net.Conn, cfg *ServerConfig) (
 // before the transport state was set to closing/draining.
 // They are now invoked after the state has been set to closing/draining
 // and after http2Client.mu has been released.
+// If ConnectionObserver is set, callers must also invoke the optional
+// ConnectionObserverActivator after success and after releasing pool locks.
 //
 // Callers that rely on the old ordering (for example, to observe the transport in a "reachable" state from
 // inside onClose or onGoAway) must migrate to NewClientTransportWithConfig and update
@@ -683,8 +693,20 @@ func NewServerTransport(ctx context.Context, conn net.Conn, cfg *ServerConfig) (
 func NewClientTransport(ctx context.Context, conn net.Conn, opts ConnectOptions,
 	remoteService string, onGoAway func(GoAwayReason), onClose func(),
 ) (ClientTransport, error) {
+	meta := connstats.Meta{}
+	if opts.ConnectionObserver != nil {
+		meta = connstats.Meta{
+			Service: remoteService,
+			Target:  conn.RemoteAddr().String(),
+			PoolID:  opts.ConnectionPoolID,
+		}
+		if opts.ShortConn {
+			meta.Mode = connstats.ModeShort
+		}
+	}
 	return newHTTP2Client(ctx, conn, opts, ClientConfig{
-		RemoteService: remoteService,
+		RemoteService:  remoteService,
+		ConnectionMeta: meta,
 		OnGoAway: func(ctx context.Context, trans ClientTransport, reason GoAwayReason) {
 			if onGoAway != nil {
 				onGoAway(reason)
@@ -705,6 +727,9 @@ var (
 
 // NewClientTransportWithConfig establishes the transport with the required ConnectOptions
 // and returns it to the caller.
+// When ConnectionObserver is set, callers must invoke the optional
+// ConnectionObserverActivator after successful construction and after releasing
+// any pool locks. Failed construction must never be activated.
 func NewClientTransportWithConfig(ctx context.Context, conn net.Conn, opts ConnectOptions,
 	cfg ClientConfig,
 ) (ClientTransport, error) {
@@ -752,6 +777,14 @@ type CallHdr struct {
 // IsActive is the interface that exposing the underlying connection's active status.
 type IsActive interface {
 	IsActive() bool
+}
+
+// ConnectionObserverActivator is an optional capability of client transports.
+// Call ActivateConnectionObserver after successful construction, outside all
+// transport and pool locks. Repeated calls are harmless and do not wait for an
+// activation already in progress. It deliberately does not extend ClientTransport.
+type ConnectionObserverActivator interface {
+	ActivateConnectionObserver()
 }
 
 // ClientTransport is the common interface for all gRPC client-side transport
