@@ -139,8 +139,14 @@ func newHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 		scheme = "https"
 	}
 	ctx, cancel := context.WithCancel(ctx)
+	transportOwned := false
 	defer func() {
-		if err != nil {
+		if !transportOwned {
+			// Until the fully initialized transport installs its own guard,
+			// construction owns the raw socket, including exceptional exits.
+			cancel()
+			_ = conn.Close()
+		} else if err != nil {
 			cancel()
 		}
 	}()
@@ -238,6 +244,16 @@ func newHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 		}()
 		cfg.OnClose(ctx, trans, err)
 	}
+	constructed := false
+	defer func() {
+		if !constructed {
+			// A custom dispatcher may panic synchronously while accepting a
+			// reader/keepalive/writer. Release resources before the construction
+			// owner activates deferred observation outside slot/singleflight.
+			_ = t.Close(connectionErrorf(true, err, "transport: client construction did not complete"))
+		}
+	}()
+	transportOwned = true
 	ticker.Add(task)
 
 	// Start the reader goroutine for incoming message. Each transport has
@@ -310,6 +326,7 @@ func newHTTP2Client(ctx context.Context, conn net.Conn, opts ConnectOptions,
 		close(t.writerDone)
 	}, gofunc.NewBasicInfo(cfg.RemoteService, conn.RemoteAddr().String()))
 
+	constructed = true
 	return t, nil
 }
 
@@ -354,7 +371,7 @@ func (task *closeStreamTask) Tick() {
 		task.toCloseStreams[i] = nil
 	}
 	task.toCloseStreams = task.toCloseStreams[:0]
-	trans.publishStreamObservation()
+	trans.publishStreamObservationIfChanged()
 }
 
 type clientTransportDump struct {
@@ -521,7 +538,7 @@ func (t *http2Client) NewStream(ctx context.Context, callHdr *CallHdr) (_ *Strea
 		}
 		// onOrphaned can run under controlBuf.mu. Update the absolute
 		// snapshot here but leave user delivery to lock-free publish sites.
-		t.observationStreamClosed()
+		s.ct.observationStreamClosed()
 		// The stream was unprocessed by the server.
 		atomic.StoreUint32(&s.unprocessed, 1)
 		s.write(recvMsg{err: err})
@@ -762,10 +779,12 @@ func (t *http2Client) Close(err error) error {
 		return nil
 	}
 	t.state = closing
-	if o := t.observation; o != nil && o.metricsEnabled {
-		o.latest.CloseReason = connectionCloseReason(err)
-		if o.latest.GoAwayReceived != 0 {
-			o.latest.CloseReason = connstats.ReasonGoAway
+	if o := t.observation; o != nil {
+		// The logical close time and terminal stream snapshot are committed now.
+		// Defer delivery until cleanup and lock-free error classification finish.
+		o.closePending = true
+		if o.metricsEnabled {
+			o.closeError = err
 		}
 	}
 	t.observationTransitionLocked(connstats.StateClosed)
@@ -790,7 +809,9 @@ func (t *http2Client) Close(err error) error {
 	}
 	// Observation is synchronous user code. Resource cleanup must complete
 	// before publishing even if a custom recorder violates its promptness contract.
-	t.publishConnectionObservation()
+	if t.observation != nil {
+		t.finishCloseObservation()
+	}
 	return cErr
 }
 

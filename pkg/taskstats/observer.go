@@ -73,6 +73,9 @@ type Observer interface{ NewTask(Meta) Recorder }
 
 // Recorder receives concurrent, potentially out-of-order snapshots outside core
 // locks. Ignore duplicate/older versions and never revive a finished task.
+// Construction may defer observation: the first snapshot can be Running or
+// Finished, with original submission/start/exit times. Intermediate transitions
+// need not be delivered; every event is a complete absolute snapshot.
 // Observe must return promptly. Observer panics are isolated from execution.
 type Recorder interface{ Observe(Event) }
 

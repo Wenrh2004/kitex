@@ -89,13 +89,23 @@ func TestConnectionObserverShortConnCanceledQuotaCleanup(t *testing.T) {
 		}
 	}()
 	ctx, cancel := context.WithCancel(newMockCtxWithRPCInfo(serviceinfo.StreamingBidirectional))
-	defer cancel()
+	t.Cleanup(func() {
+		cancel()
+		_ = client.Close()
+		_ = server.Close()
+		select {
+		case <-peerClosed:
+		case <-time.After(3 * time.Second):
+			t.Error("quota test peer did not exit during cleanup")
+		}
+	})
 	observer := &poolConnectionObserver{onNew: func(connstats.Meta) {
 		select {
 		case <-acked:
 			cancel() // SETTINGS=0 has been processed, so NewStream must wait.
 		case <-time.After(3 * time.Second):
 			t.Error("SETTINGS ACK never arrived")
+			cancel() // Also release NewStream when the fixture handshake failed.
 		}
 	}}
 	p := observerPool(t, observer, true)
@@ -281,14 +291,26 @@ type connectionPipePeer struct {
 	fr     *http2.Framer
 	ready  chan struct{}
 	header chan struct{}
+	done   chan struct{}
 }
 
 func newConnectionPipe(t *testing.T) (net.Conn, *connectionPipePeer) {
 	t.Helper()
 	client, server := net.Pipe()
-	peer := &connectionPipePeer{conn: server, fr: http2.NewFramer(server, server), ready: make(chan struct{}), header: make(chan struct{}, 4)}
-	t.Cleanup(func() { _ = client.Close(); _ = server.Close() })
+	peer := &connectionPipePeer{conn: server, fr: http2.NewFramer(server, server), ready: make(chan struct{}), header: make(chan struct{}, 4), done: make(chan struct{})}
+	stop := make(chan struct{})
+	t.Cleanup(func() {
+		close(stop)
+		_ = client.Close()
+		_ = server.Close()
+		select {
+		case <-peer.done:
+		case <-time.After(3 * time.Second):
+			t.Error("connection test peer did not exit during cleanup")
+		}
+	})
 	go func() {
+		defer close(peer.done)
 		preface := make([]byte, len(http2.ClientPreface))
 		if _, err := io.ReadFull(server, preface); err != nil {
 			return
@@ -309,7 +331,11 @@ func newConnectionPipe(t *testing.T) (net.Conn, *connectionPipePeer) {
 				return
 			}
 			if _, ok := frame.(*http2.HeadersFrame); ok {
-				peer.header <- struct{}{}
+				select {
+				case peer.header <- struct{}{}:
+				case <-stop:
+					return
+				}
 			}
 		}
 	}()

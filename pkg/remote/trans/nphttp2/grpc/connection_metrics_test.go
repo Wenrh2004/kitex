@@ -101,6 +101,7 @@ func TestConnectionMetricsStreamLifecycleAndGoAway(t *testing.T) {
 		t.Fatalf("after GOAWAY rejected stream = %+v", event)
 	}
 	client.CloseStream(first, nil)
+	awaitConnectionSignal(t, r.terminalSignal())
 	awaitConnectionSignal(t, client.ctx.Done())
 	awaitConnectionSignal(t, client.readerDone)
 	latest, _ := r.snapshot()
@@ -316,6 +317,14 @@ func TestConnectionMetricsBlockingTerminalAfterAllStreamsCleaned(t *testing.T) {
 	}
 	client := tr.(*http2Client)
 	client.ActivateConnectionObserver()
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		unblock()
+		_ = client.Close(ErrConnClosing)
+		awaitConnectionSignal(t, client.readerDone)
+		awaitConnectionSignal(t, client.writerDone)
+	})
 	var streams []*Stream
 	for i := 0; i < 3; i++ {
 		stream, err := client.NewStream(context.Background(), &CallHdr{Method: "/service/method"})
@@ -325,13 +334,14 @@ func TestConnectionMetricsBlockingTerminalAfterAllStreamsCleaned(t *testing.T) {
 		streams = append(streams, stream)
 	}
 	go func() { _ = client.Close(ErrConnClosing); close(done) }()
+	t.Cleanup(func() { unblock(); awaitConnectionSignal(t, done) })
 	awaitConnectionSignal(t, entered)
 	awaitConnectionSignal(t, client.ctx.Done())
 	awaitConnectionSignal(t, client.conn.(*connectionObserverTestConn).closed)
 	for _, stream := range streams {
 		awaitConnectionSignal(t, stream.done)
 	}
-	close(release)
+	unblock()
 	awaitConnectionSignal(t, done)
 	awaitConnectionSignal(t, client.readerDone)
 	awaitConnectionSignal(t, client.writerDone)

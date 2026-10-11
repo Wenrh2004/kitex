@@ -356,9 +356,6 @@ func (s *server) invokeHandleEndpoint() endpoint.UnaryEndpoint {
 		if methodName == "" && svcInfo.ServiceName != serviceinfo.GenericService {
 			return errors.New("method name is empty in rpcinfo, should not happen")
 		}
-		task := taskstats.Begin(s.opt.TaskObserver, taskstats.Meta{
-			Executor: "kitex.server.handler", Type: "inline", Role: "server", Service: svcInfo.ServiceName,
-		})
 		defer func() {
 			if handlerErr := recover(); handlerErr != nil {
 				err = kerrors.ErrPanic.WithCauseAndStack(
@@ -377,11 +374,16 @@ func (s *server) invokeHandleEndpoint() endpoint.UnaryEndpoint {
 		rpcinfo.Record(ctx, ri, stats.ServerHandleStart, nil)
 		// set session
 		backup.BackupCtx(ctx)
+		handler := svc.getHandler(methodName)
+		// Preparation failures do not represent an accepted business handler.
+		task := taskstats.Begin(s.opt.TaskObserver, taskstats.Meta{
+			Executor: "kitex.server.handler", Type: "inline", Role: "server", Service: svcInfo.ServiceName,
+		})
 		if task == nil {
-			err = implHandlerFunc(ctx, svc.getHandler(methodName), args, resp)
+			err = implHandlerFunc(ctx, handler, args, resp)
 		} else {
 			task.RunOutcome(func() taskstats.Outcome {
-				err = implHandlerFunc(ctx, svc.getHandler(methodName), args, resp)
+				err = implHandlerFunc(ctx, handler, args, resp)
 				if err != nil {
 					return taskstats.OutcomeError
 				}
@@ -412,9 +414,6 @@ func (s *server) streamHandleEndpoint() sep.StreamEndpoint {
 		if methodName == "" && svcInfo.ServiceName != serviceinfo.GenericService {
 			return errors.New("method name is empty in rpcinfo, should not happen")
 		}
-		task := taskstats.Begin(s.opt.TaskObserver, taskstats.Meta{
-			Executor: "kitex.server.handler", Type: "inline", Role: "server", Service: svcInfo.ServiceName,
-		})
 		defer func() {
 			if handlerErr := recover(); handlerErr != nil {
 				err = kerrors.ErrPanic.WithCauseAndStack(
@@ -445,11 +444,15 @@ func (s *server) streamHandleEndpoint() sep.StreamEndpoint {
 				}
 			}
 		}
+		handler := svc.getHandler(methodName)
+		task := taskstats.Begin(s.opt.TaskObserver, taskstats.Meta{
+			Executor: "kitex.server.handler", Type: "inline", Role: "server", Service: svcInfo.ServiceName,
+		})
 		if task == nil {
-			err = implHandlerFunc(ctx, svc.getHandler(methodName), args, nil)
+			err = implHandlerFunc(ctx, handler, args, nil)
 		} else {
 			task.RunOutcome(func() taskstats.Outcome {
-				err = implHandlerFunc(ctx, svc.getHandler(methodName), args, nil)
+				err = implHandlerFunc(ctx, handler, args, nil)
 				if err != nil {
 					return taskstats.OutcomeError
 				}

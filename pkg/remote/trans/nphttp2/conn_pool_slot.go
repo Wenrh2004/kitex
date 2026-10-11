@@ -22,6 +22,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/cloudwego/kitex/internal/taskscope"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/codes"
 	"github.com/cloudwego/kitex/pkg/remote/trans/nphttp2/grpc"
@@ -79,17 +80,10 @@ func (t *transports) getActiveTransport() (grpc.ClientTransport, uint32) {
 func (t *transports) createTransport(idx uint32, remoteService string,
 	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
 ) (grpc.ClientTransport, error) {
-	creation, err := t.createTransportDeferred(idx, remoteService, dialer, network, address, connectTimeout, opts)
-	creation.finish(true)
+	creation := &transportCreation{}
+	defer creation.finish(true)
+	err := t.getTransportSlot(idx).createTransportInto(creation, remoteService, dialer, network, address, connectTimeout, opts)
 	return creationTransport(creation), err
-}
-
-// createTransportDeferred is the singleflight-safe entry point. Its caller
-// publishes the address before finishing observation outside singleflight.
-func (t *transports) createTransportDeferred(idx uint32, remoteService string,
-	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
-) (*transportCreation, error) {
-	return t.getTransportSlot(idx).createTransportDeferred(remoteService, dialer, network, address, connectTimeout, opts)
 }
 
 // loadAll returns a snapshot of all non-nil transports across all slots.
@@ -144,28 +138,31 @@ func (slot *transportSlot) createTransport(
 	remoteService string,
 	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
 ) (grpc.ClientTransport, error) {
-	creation, err := slot.createTransportDeferred(remoteService, dialer, network, address, connectTimeout, opts)
-	creation.finish(false)
+	creation := &transportCreation{}
+	defer creation.finish(false)
+	err := slot.createTransportInto(creation, remoteService, dialer, network, address, connectTimeout, opts)
 	return creationTransport(creation), err
 }
 
-func (slot *transportSlot) createTransportDeferred(
+// The caller installs the result before construction so even synchronous
+// dispatcher panic/Goexit can finish deferred tasks outside singleflight.
+func (slot *transportSlot) createTransportInto(creation *transportCreation,
 	remoteService string,
 	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
-) (*transportCreation, error) {
+) error {
 	slot.mu.Lock()
+	defer slot.mu.Unlock()
 	if slot.state == slotClosed {
-		slot.mu.Unlock()
-		return nil, errTransportsClosed
+		return errTransportsClosed
 	}
 
 	// Double-check: another goroutine may have filled this slot.
 	if ref := slot.ref.Load(); ref != nil && checkActive(ref.ct) {
-		slot.mu.Unlock()
-		return &transportCreation{transport: ref.ct}, nil
+		creation.transport = ref.ct
+		return nil
 	}
 
-	newTrans, dialObservation, err := newTransportWithDialObservation(remoteService, dialer, network, address, connectTimeout, opts,
+	newTrans, err := newTransportWithDialObservation(creation, remoteService, dialer, network, address, connectTimeout, opts,
 		func(ctx context.Context, trans grpc.ClientTransport, reason grpc.GoAwayReason) {
 			slot.removeTransport(trans)
 		},
@@ -174,13 +171,12 @@ func (slot *transportSlot) createTransportDeferred(
 		},
 	)
 	if err != nil {
-		slot.mu.Unlock()
-		return &transportCreation{dial: dialObservation}, err
+		return err
 	}
 
-	oldRef := slot.ref.Swap(&transportRef{ct: newTrans})
-	slot.mu.Unlock()
-	return &transportCreation{transport: newTrans, dial: dialObservation, old: oldRef}, nil
+	creation.old = slot.ref.Swap(&transportRef{ct: newTrans})
+	creation.transport = newTrans
+	return nil
 }
 
 // transportCreation is shared by all callers of one completed singleflight.
@@ -188,6 +184,7 @@ func (slot *transportSlot) createTransportDeferred(
 type transportCreation struct {
 	transport grpc.ClientTransport
 	dial      *transportDialObservation
+	tasks     *taskscope.Scope
 	old       *transportRef
 	closing   *transports
 	claimed   uint32
@@ -215,7 +212,12 @@ func (creation *transportCreation) finish(activate bool) {
 			creation.old.ct.GracefulClose()
 		}
 		atomic.StoreUint32(&creation.cleaned, 1)
-		creation.dial.publish()
+		func() {
+			// An error classifier or dial observer can call Goexit. Preserve
+			// that exit, but still activate tasks after cleanup and flight removal.
+			defer creation.tasks.Activate()
+			creation.dial.publish()
+		}()
 	} else if atomic.LoadUint32(&creation.cleaned) == 0 {
 		// The claiming caller will activate after required cleanup. Do not
 		// publish early, and do not wait for a possibly slow callback.

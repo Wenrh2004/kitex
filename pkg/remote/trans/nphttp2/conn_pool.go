@@ -30,6 +30,7 @@ import (
 
 	"golang.org/x/sync/singleflight"
 
+	"github.com/cloudwego/kitex/internal/taskscope"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/remote"
 	"github.com/cloudwego/kitex/pkg/remote/connstats"
@@ -87,6 +88,9 @@ type connPool struct {
 var (
 	_                 remote.LongConnPool = (*connPool)(nil)
 	errConnPoolClosed                     = status.Err(codes.Aborted, "connection pool has been closed")
+	// singleflight v0.11 does not retain a legacy panic(nil). Bridge only that
+	// value through its panicError's Unwrap, then restore it outside the flight.
+	errNilTransportConstructionPanic = errors.New("legacy nil panic during transport construction")
 )
 
 // Get pick or generate a net.Conn and return
@@ -127,7 +131,7 @@ func (p *connPool) Get(ctx context.Context, network, address string, opt remote.
 			klog.CtxDebugf(ctx, "KITEX: New grpc stream failed, network=%s, address=%s, error=%s", network, address, err.Error())
 		}
 	}
-	rawTr, dErr, _ := p.sfg.Do(address, func() (i interface{}, e error) {
+	rawTr, dErr := p.doTransportCreation(address, func(res *transportCreation) (interface{}, error) {
 		var trans *transports
 		var isNew bool
 		// avoid creating duplicate transports
@@ -138,7 +142,7 @@ func (p *connPool) Get(ctx context.Context, network, address string, opt remote.
 			isNew = true
 		}
 
-		res, cErr := trans.createTransportDeferred(idx, p.remoteService, opt.Dialer, network, address, opt.ConnectTimeout, p.connOpts)
+		cErr := trans.getTransportSlot(idx).createTransportInto(res, p.remoteService, opt.Dialer, network, address, opt.ConnectTimeout, p.connOpts)
 		if cErr != nil {
 			return res, cErr
 		}
@@ -173,6 +177,51 @@ func (p *connPool) Get(ctx context.Context, network, address string, opt remote.
 	}
 	klog.CtxDebugf(ctx, "KITEX: New grpc client connection succeed, network=%s, address=%s", network, address)
 	return newClientConn(ctx, creation.transport, address)
+}
+
+// doTransportCreation installs the result before dispatching any task. Its
+// deferred finish runs after singleflight removes the call and slot ownership
+// releases its mutex. Only the leader owns an exceptional construction result.
+func (p *connPool) doTransportCreation(address string, fn func(*transportCreation) (interface{}, error)) (interface{}, error) {
+	var interrupted *transportCreation
+	defer func() {
+		recovered := recover()
+		interrupted.finish(false)
+		if recovered != nil {
+			// singleflight's panicError unwraps exactly to the original panic
+			// value. Avoid traversing user error Is/Unwrap methods here.
+			if err, ok := recovered.(interface{ Unwrap() error }); ok && err.Unwrap() == errNilTransportConstructionPanic {
+				panic(nil)
+			}
+			panic(recovered)
+		}
+	}()
+	result, err, _ := p.sfg.Do(address, func() (interface{}, error) {
+		creation := &transportCreation{}
+		interrupted = creation
+		return bridgeNilConstructionPanic(func() (interface{}, error) { return fn(creation) })
+	})
+	return result, err
+}
+
+func bridgeNilConstructionPanic(fn func() (interface{}, error)) (result interface{}, err error) {
+	returned := false
+	func() {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				// Preserve ordinary panic values and their existing singleflight
+				// treatment. Only a recovered legacy nil panic reaches below.
+				panic(recovered)
+			}
+		}()
+		result, err = fn()
+		returned = true
+	}()
+	if !returned {
+		// Goexit continues unwinding its goroutine, so never reaches here.
+		panic(errNilTransportConstructionPanic)
+	}
+	return result, err
 }
 
 // Put implements the ConnPool interface.
@@ -295,48 +344,75 @@ func newTransport(remoteService string,
 	onGoAway func(context.Context, grpc.ClientTransport, grpc.GoAwayReason),
 	onClose func(context.Context, grpc.ClientTransport, error),
 ) (grpc.ClientTransport, error) {
-	tr, observation, err := newTransportWithDialObservation(remoteService, dialer, network, address, connectTimeout, opts, onGoAway, onClose)
-	observation.publish()
-	return tr, err
+	creation := &transportCreation{}
+	defer creation.finish(false)
+	return newTransportWithDialObservation(creation, remoteService, dialer, network, address, connectTimeout, opts, onGoAway, onClose)
 }
 
 // The caller owning a slot lock defers delivery until after unlocking. Dial
 // tracking describes only real attempts, never reuse or pool rejection.
-func newTransportWithDialObservation(remoteService string,
+func newTransportWithDialObservation(creation *transportCreation, remoteService string,
 	dialer remote.Dialer, network, address string, connectTimeout time.Duration, opts grpc.ConnectOptions,
 	onGoAway func(context.Context, grpc.ClientTransport, grpc.GoAwayReason),
 	onClose func(context.Context, grpc.ClientTransport, error),
-) (tr grpc.ClientTransport, observation *transportDialObservation, err error) {
+) (tr grpc.ClientTransport, err error) {
 	mode := connstats.ModeLong
 	if opts.ShortConn {
 		mode = connstats.ModeShort
 	}
 	meta := connstats.Meta{Service: remoteService, Target: address, Mode: mode, PoolID: opts.ConnectionPoolID}
+	var observation *transportDialObservation
 	if observer, ok := opts.ConnectionObserver.(connstats.DialObserver); ok {
 		observation = &transportDialObservation{observer: observer, meta: meta}
+		creation.dial = observation
 		started := time.Now()
 		defer func() { observation.event.Duration = time.Since(started) }()
 	}
+	constructed := false
+	stage := connstats.DialFailed
+	defer func() {
+		// An exceptional Dialer/TLS/dispatcher exit has no ordinary error
+		// return to classify. Never publish the zero-valued Established outcome
+		// for it, and preserve any failure already classified below.
+		if observation != nil && !constructed && observation.event.Outcome == connstats.DialEstablished {
+			observation.event.Outcome = stage
+			observation.event.Reason = connstats.ReasonOther
+		}
+	}()
 	conn, err := dialer.DialTimeout(network, address, connectTimeout)
 	if err != nil {
 		observation.failed(connstats.DialFailed, err)
-		return nil, observation, err
+		return nil, err
 	}
+	rawOwned := true
+	defer func() {
+		if rawOwned {
+			// This owner covers TLS/context preparation exceptions. Once grpc
+			// construction begins, that constructor owns all cleanup paths.
+			_ = conn.Close()
+		}
+	}()
 	if opts.TLSConfig != nil {
+		stage = connstats.DialTLSFailed
 		tlsConn, tErr := newTLSConn(conn, opts.TLSConfig)
 		if tErr != nil {
 			// release tls handshake failed connection
 			cErr := conn.Close()
+			rawOwned = false
 			if cErr != nil {
 				klog.Warnf("KITEX: Close TLS handshake failed connection, err: %v", cErr)
 			}
 			observation.failed(connstats.DialTLSFailed, tErr)
-			return nil, observation, tErr
+			return nil, tErr
 		}
 		conn = tlsConn
 	}
+	constructionCtx, scope := taskscope.NewContext(context.Background())
+	creation.tasks = scope
+	stage = connstats.DialTransportFailed
+	rawOwned = false
 	tr, err = grpc.NewClientTransportWithConfig(
-		context.Background(), // gRPC connection does not need to be bound to a specific ctx
+		constructionCtx, // transport lifetime is independent of the RPC context
 		conn,
 		opts,
 		grpc.ClientConfig{
@@ -349,13 +425,15 @@ func newTransportWithDialObservation(remoteService string,
 	if err != nil {
 		observation.failed(connstats.DialTransportFailed, err)
 	}
-	return tr, observation, err
+	constructed = err == nil
+	return tr, err
 }
 
 type transportDialObservation struct {
 	observer connstats.DialObserver
 	meta     connstats.Meta
 	event    connstats.DialEvent
+	failure  error // retained only until publication outside slot locks and singleflight
 }
 
 var dialObserverLastWarning atomic.Int64
@@ -365,27 +443,47 @@ func (o *transportDialObservation) failed(outcome connstats.DialOutcome, err err
 		return
 	}
 	o.event.Outcome = outcome
+	o.event.Reason = connstats.ReasonOther
+	o.failure = err
+}
+
+func safeDialFailureReason(outcome connstats.DialOutcome, err error) (reason connstats.Reason) {
+	reason = connstats.ReasonOther
+	returned := false
+	defer func() {
+		if !returned {
+			_ = recover()
+			reason = connstats.ReasonOther
+			warnConnPoolObserverPanic("DialReason")
+		}
+	}()
+	reason = classifyDialFailure(outcome, err)
+	returned = true
+	return reason
+}
+
+func classifyDialFailure(outcome connstats.DialOutcome, err error) connstats.Reason {
 	if connectionErr, ok := err.(grpc.ConnectionError); ok {
 		err = connectionErr.Origin()
 	}
 	switch {
 	case errors.Is(err, context.Canceled):
-		o.event.Reason = connstats.ReasonCanceled
+		return connstats.ReasonCanceled
 	case errors.Is(err, context.DeadlineExceeded):
-		o.event.Reason = connstats.ReasonDeadline
+		return connstats.ReasonDeadline
 	case errors.Is(err, io.EOF), errors.Is(err, io.ErrClosedPipe), errors.Is(err, net.ErrClosed):
-		o.event.Reason = connstats.ReasonNetwork
+		return connstats.ReasonNetwork
 	default:
 		var networkError net.Error
 		if errors.As(err, &networkError) {
-			o.event.Reason = connstats.ReasonNetwork
 			if networkError.Timeout() {
-				o.event.Reason = connstats.ReasonDeadline
+				return connstats.ReasonDeadline
 			}
+			return connstats.ReasonNetwork
 		} else if outcome == connstats.DialTLSFailed || outcome == connstats.DialTransportFailed {
-			o.event.Reason = connstats.ReasonProtocol
+			return connstats.ReasonProtocol
 		} else {
-			o.event.Reason = connstats.ReasonOther
+			return connstats.ReasonOther
 		}
 	}
 }
@@ -394,16 +492,36 @@ func (o *transportDialObservation) publish() {
 	if o == nil {
 		return
 	}
+	failure := o.failure
+	o.failure = nil
+	event := o.event
+	// Classifiers may call Goexit. Preserve that exit while still reporting the
+	// completed attempt, with the fallback reason already recorded by failed.
+	defer func() { o.publishEvent(event) }()
+	if failure != nil {
+		event.Reason = safeDialFailureReason(event.Outcome, failure)
+	}
+}
+
+func (o *transportDialObservation) publishEvent(event connstats.DialEvent) {
+	returned := false
 	defer func() {
-		if recovered := recover(); recovered != nil {
-			now := time.Now().UnixNano()
-			previous := dialObserverLastWarning.Load()
-			if (previous == 0 || now-previous >= int64(time.Minute)) && dialObserverLastWarning.CompareAndSwap(previous, now) {
-				klog.Warnf("KITEX: gRPC connection observer ObserveDial panic (warnings limited to once per minute): %v", recovered)
-			}
+		if !returned {
+			_ = recover()
+			warnConnPoolObserverPanic("ObserveDial")
 		}
 	}()
-	o.observer.ObserveDial(o.meta, o.event)
+	o.observer.ObserveDial(o.meta, event)
+	returned = true
+}
+
+func warnConnPoolObserverPanic(phase string) {
+	defer func() { _ = recover() }()
+	now := time.Now().UnixNano()
+	previous := dialObserverLastWarning.Load()
+	if (previous == 0 || now-previous >= int64(time.Minute)) && dialObserverLastWarning.CompareAndSwap(previous, now) {
+		klog.Warnf("KITEX: gRPC connection observer %s panic; observation may be incomplete (warnings limited to once per minute)", phase)
+	}
 }
 
 // activateConnectionObserver must run after releasing transport creation locks.

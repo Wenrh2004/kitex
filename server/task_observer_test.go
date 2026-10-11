@@ -19,13 +19,17 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"runtime"
+	"strings"
 	"testing"
 	"time"
 
 	internalserver "github.com/cloudwego/kitex/internal/server"
 	"github.com/cloudwego/kitex/pkg/rpcinfo"
 	"github.com/cloudwego/kitex/pkg/serviceinfo"
+	"github.com/cloudwego/kitex/pkg/stats"
+	"github.com/cloudwego/kitex/pkg/streaming"
 	"github.com/cloudwego/kitex/pkg/taskstats"
 	"github.com/cloudwego/kitex/pkg/utils"
 )
@@ -33,6 +37,73 @@ import (
 type handlerObserver struct {
 	metas  []taskstats.Meta
 	events []taskstats.Event
+}
+
+type preparationPanicMethod struct{ serviceinfo.MethodInfo }
+
+func (preparationPanicMethod) Handler() serviceinfo.MethodHandler { panic("handler preparation panic") }
+
+type preparationPanicStream struct{ streaming.ServerStream }
+
+func (preparationPanicStream) GetGRPCStream() streaming.Stream { panic("stream preparation panic") }
+
+func TestServerPreparationFailureDoesNotCreateTask(t *testing.T) {
+	for _, stream := range []bool{false, true} {
+		for _, stage := range []string{"method", "handler", "stream"} {
+			if stage == "stream" && !stream {
+				continue
+			}
+			t.Run(fmt.Sprintf("stream=%v/%s", stream, stage), func(t *testing.T) {
+				o := &handlerObserver{}
+				opts := internalserver.NewOptions(nil)
+				opts.TaskObserver = o
+				executed := false
+				method := serviceinfo.NewMethodInfo(func(context.Context, interface{}, interface{}, interface{}) error {
+					executed = true
+					return nil
+				}, func() interface{} { return nil }, func() interface{} { return nil }, false)
+				info := &serviceinfo.ServiceInfo{ServiceName: "svc", Methods: map[string]serviceinfo.MethodInfo{"method": method}}
+				svcs := newServices()
+				svcs.addService(info, nil, &RegisterOptions{})
+				s := &server{opt: opts, svcs: svcs}
+				inv := rpcinfo.NewInvocation("svc", "method")
+				inv.SetMethodInfo(method)
+				if stage == "method" {
+					inv.SetMethodInfo(preparationPanicMethod{MethodInfo: method})
+				}
+				if stage == "handler" {
+					svc := svcs.getService("svc")
+					svc.unknownMethodHandler = new(struct{})
+					svc.svcInfo.GenericMethod = func(context.Context, string) serviceinfo.MethodInfo {
+						panic("handler lookup preparation panic")
+					}
+					delete(info.Methods, "method")
+				}
+				rpcStats := rpcinfo.NewRPCStats()
+				rpcinfo.AsMutableRPCStats(rpcStats).SetLevel(stats.LevelDetailed)
+				ctx := rpcinfo.NewCtxWithRPCInfo(context.Background(), rpcinfo.NewRPCInfo(nil, nil, inv, rpcinfo.NewRPCConfig(), rpcStats))
+				var err error
+				if stream {
+					var st streaming.ServerStream
+					if stage == "stream" {
+						st = preparationPanicStream{}
+					}
+					err = s.streamHandleEndpoint()(ctx, st)
+				} else {
+					err = s.invokeHandleEndpoint()(ctx, nil, nil)
+				}
+				if err == nil || !strings.Contains(err.Error(), "preparation panic") || executed {
+					t.Fatalf("preparation error = %v, handler executed = %v", err, executed)
+				}
+				if len(o.metas) != 0 || len(o.events) != 0 {
+					t.Fatalf("unaccepted handler created a task: metas = %+v, events = %+v", o.metas, o.events)
+				}
+				if panicked, _ := rpcStats.Panicked(); !panicked || rpcStats.GetEvent(stats.ServerHandleFinish) == nil {
+					t.Fatal("preparation panic lost original RPC panic or finish diagnostics")
+				}
+			})
+		}
+	}
 }
 
 func (o *handlerObserver) NewTask(m taskstats.Meta) taskstats.Recorder {

@@ -324,11 +324,6 @@ func (t *timeoutTask) Wait() (returnedCtx context.Context, err error) {
 	return t.ctx, t.ctx.Err()
 }
 
-func (t *timeoutTask) waitNoTimeout() (context.Context, error) {
-	var cause error
-	return t.waitNoTimeoutObserved(&cause)
-}
-
 func (t *timeoutTask) waitNoTimeoutObserved(callerCause *error) (context.Context, error) {
 	select {
 	case <-t.ctx.Done(): // finished before parent done

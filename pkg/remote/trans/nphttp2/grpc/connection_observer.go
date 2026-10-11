@@ -41,8 +41,11 @@ type connectionObservation struct {
 	activationStarted uint32
 	recorder          connstats.Recorder
 	latest            connstats.Event
+	closePending      bool  // resource cleanup or final close reason classification is in progress
+	closeError        error // retained only for deferred classification at first activation
 	metricsEnabled    bool
 	streams           connstats.StreamEvent
+	streamAttempted   uint64 // highest snapshot handed to a recorder, not guaranteed delivery
 	waits             map[*quotaWaitObservation]struct{}
 }
 
@@ -103,6 +106,10 @@ func (t *http2Client) publishConnectionObservation() {
 		return
 	}
 	t.mu.Lock()
+	if t.observation.closePending {
+		t.mu.Unlock()
+		return
+	}
 	r, event := t.observation.recorder, t.observation.latest
 	event.Streams = t.observation.streams
 	t.mu.Unlock()
@@ -128,12 +135,65 @@ func (t *http2Client) ActivateConnectionObserver() {
 	r := safeNewConnection(factory, meta)
 	t.mu.Lock()
 	o.recorder = r
+	if r == nil {
+		o.closeError = nil
+	}
+	if o.closePending {
+		t.mu.Unlock()
+		return
+	}
+	if o.latest.State == connstats.StateClosed {
+		// Close may have completed before activation, including while transport
+		// construction held a pool lock. Classify its error only at this boundary.
+		o.closePending = true
+		t.mu.Unlock()
+		t.finishCloseObservation()
+		return
+	}
 	event := o.latest
 	event.Streams = o.streams
 	t.mu.Unlock()
 	if r != nil {
 		safeObserveConnection(r, event)
 	}
+}
+
+// finishCloseObservation runs after physical cleanup, or at the first activation
+// of an already closed transport. Only those two owners reach this boundary;
+// closePending prevents either owner from publishing an incomplete terminal.
+func (t *http2Client) finishCloseObservation() {
+	t.mu.Lock()
+	o := t.observation
+	if o == nil {
+		t.mu.Unlock()
+		return
+	}
+	if !o.metricsEnabled || o.recorder == nil || o.latest.CloseReason != connstats.ReasonNone {
+		if !o.metricsEnabled || o.latest.CloseReason != connstats.ReasonNone {
+			o.closeError = nil
+		}
+		o.closePending = false
+		t.mu.Unlock()
+		t.publishConnectionObservation()
+		return
+	}
+	err := o.closeError
+	o.closeError = nil
+	t.mu.Unlock()
+	reason := connstats.ReasonOther
+	// An error method may call Goexit. Keep that exit while still delivering the
+	// complete logical terminal with its original close time and stream totals.
+	defer func() {
+		t.mu.Lock()
+		if o.latest.GoAwayReceived != 0 {
+			reason = connstats.ReasonGoAway
+		}
+		o.latest.CloseReason = reason
+		o.closePending = false
+		t.mu.Unlock()
+		t.publishConnectionObservation()
+	}()
+	reason = safeConnectionCloseReason(err)
 }
 
 // Called while holding t.mu, alongside stream insertion. The check is kept
@@ -223,29 +283,68 @@ func (t *http2Client) observationCapacity(capacity uint32) {
 }
 
 func (t *http2Client) publishStreamObservation() {
+	t.publishStreamSnapshot(false)
+}
+
+// The ticker catches stream orphan cleanup performed under controlBuf.mu, but
+// need not repeat unchanged snapshots on every tick. A callback panic is an
+// observation loss; retrying it could repeat partial SDK side effects. Embedded
+// lifecycle snapshots do not advance this watermark: a recorder may discard a
+// repeated lifecycle version without consuming its newer stream version.
+func (t *http2Client) publishStreamObservationIfChanged() {
+	t.publishStreamSnapshot(true)
+}
+
+func (t *http2Client) publishStreamSnapshot(changedOnly bool) {
 	if t.observation == nil || !t.observation.metricsEnabled {
 		return
 	}
 	t.mu.Lock()
-	r, event := t.observation.recorder, t.observation.streams
-	t.mu.Unlock()
+	o := t.observation
 	// Terminal lifecycle delivery carries the final embedded stream snapshot,
 	// after all socket and stream cleanup. Do not interrupt that cleanup batch.
-	if event.Terminal {
+	if o.streams.Terminal || (changedOnly && o.streams.Version <= o.streamAttempted) {
+		t.mu.Unlock()
 		return
 	}
-	if metrics, ok := r.(connstats.MetricsRecorder); ok {
+	metrics, ok := o.recorder.(connstats.MetricsRecorder)
+	event := o.streams
+	if ok && event.Version > o.streamAttempted {
+		o.streamAttempted = event.Version
+	}
+	t.mu.Unlock()
+	if ok {
 		safeObserveStreams(metrics, event)
 	}
 }
 
 func safeObserveStreams(recorder connstats.MetricsRecorder, event connstats.StreamEvent) {
+	returned := false
 	defer func() {
-		if p := recover(); p != nil {
-			warnConnectionObserverPanic("ObserveStreams", p)
+		if !returned {
+			_ = recover()
+			warnConnectionObserverPanic("ObserveStreams")
 		}
 	}()
 	recorder.ObserveStreams(event)
+	returned = true
+}
+
+// Error methods are application code too. Classify only after closing resources
+// and outside transport locks, without letting a panic change transport cleanup.
+func safeConnectionCloseReason(err error) (reason connstats.Reason) {
+	reason = connstats.ReasonOther
+	returned := false
+	defer func() {
+		if !returned {
+			_ = recover()
+			reason = connstats.ReasonOther
+			warnConnectionObserverPanic("CloseReason")
+		}
+	}()
+	reason = connectionCloseReason(err)
+	returned = true
+	return reason
 }
 
 func connectionCloseReason(err error) connstats.Reason {
@@ -291,35 +390,45 @@ func connectionCloseReason(err error) connstats.Reason {
 }
 
 func safeNewConnection(factory connstats.Observer, meta connstats.Meta) (r connstats.Recorder) {
+	returned := false
 	defer func() {
-		if p := recover(); p != nil {
+		if !returned {
+			_ = recover()
 			r = nil
-			warnConnectionObserverPanic("NewConnection", p)
+			warnConnectionObserverPanic("NewConnection")
 		}
 	}()
-	return factory.NewConnection(meta)
+	r = factory.NewConnection(meta)
+	returned = true
+	return r
 }
 
 func safeObserveConnection(recorder connstats.Recorder, event connstats.Event) {
+	returned := false
 	defer func() {
-		if p := recover(); p != nil {
-			warnConnectionObserverPanic("Observe", p)
+		if !returned {
+			_ = recover()
+			warnConnectionObserverPanic("Observe")
 		}
 	}()
 	recorder.Observe(event)
+	returned = true
 }
 
 // A broken observer must not panic into transport cleanup or flood the logs.
 // The limit is shared across observer calls and transports, once per minute.
 var connectionObserverLastWarning atomic.Int64
 
-func warnConnectionObserverPanic(operation string, recovered interface{}) {
+func warnConnectionObserverPanic(operation string) {
+	// The application logger is another extension. Diagnostics must not
+	// interrupt resource cleanup or invoke methods on arbitrary panic values.
+	defer func() { _ = recover() }()
 	now := time.Now().UnixNano()
 	previous := connectionObserverLastWarning.Load()
 	if previous != 0 && now-previous < int64(time.Minute) {
 		return
 	}
 	if connectionObserverLastWarning.CompareAndSwap(previous, now) {
-		klog.Warnf("KITEX: gRPC connection observer %s panic (warnings limited to once per minute): %v", operation, recovered)
+		klog.Warnf("KITEX: panic in gRPC connection observer %s; observation may be incomplete (warnings limited to once per minute)", operation)
 	}
 }

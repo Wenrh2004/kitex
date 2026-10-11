@@ -23,6 +23,7 @@ import (
 
 	"github.com/bytedance/gopkg/util/gopool"
 
+	"github.com/cloudwego/kitex/internal/taskscope"
 	"github.com/cloudwego/kitex/pkg/klog"
 	"github.com/cloudwego/kitex/pkg/profiler"
 	"github.com/cloudwego/kitex/pkg/taskstats"
@@ -37,7 +38,7 @@ var GoFunc GoTask
 func init() {
 	GoFunc = func(ctx context.Context, f func()) {
 		if holder := defaultTaskObserver.Load(); holder != nil && !observationOwned(ctx) {
-			task := taskstats.Begin(holder.observer, taskstats.Meta{
+			task := taskstats.Begin(taskscope.Observer(ctx, holder.observer), taskstats.Meta{
 				Executor: "kitex.gofunc", Type: "pooled", Role: "global",
 			})
 			original := f
@@ -55,21 +56,29 @@ func init() {
 // It is used for panic defence and output key info for troubleshooting.
 func RecoverGoFuncWithInfo(ctx context.Context, task func(), info *Info) {
 	var observed *taskstats.Task
+	var owner *observedContext
 	if holder := defaultTaskObserver.Load(); holder != nil {
 		// GoFunc is publicly replaceable. This helper does not assume that
 		// its actual dispatcher is the shared gopool.
-		observed = taskstats.Begin(holder.observer, taskstats.Meta{
+		observed = taskstats.Begin(taskscope.Observer(ctx, holder.observer), taskstats.Meta{
 			Executor: "kitex.gofunc.recover", Type: "custom", Role: "global",
 		})
-		ctx = &observedContext{Context: ctx}
+		owner = &observedContext{Context: ctx}
+		ctx = owner
 	}
 	submitted := false
 	defer func() {
 		if !submitted {
+			if owner != nil {
+				owner.retired.Store(true)
+			}
 			observed.Finish(taskstats.OutcomeError)
 		}
 	}()
 	GoFunc(ctx, func() {
+		if owner != nil {
+			owner.retired.Store(true)
+		}
 		observed.Start()
 		outcome := taskstats.OutcomeAborted
 		defer func() {

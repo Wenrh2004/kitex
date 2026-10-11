@@ -43,9 +43,10 @@ type connectionRecorderFunc func(connstats.Event)
 func (f connectionRecorderFunc) Observe(event connstats.Event) { f(event) }
 
 type connectionEventRecorder struct {
-	mu     sync.Mutex
-	events []connstats.Event
-	latest connstats.Event
+	mu       sync.Mutex
+	events   []connstats.Event
+	latest   connstats.Event
+	terminal chan struct{}
 }
 
 func (r *connectionEventRecorder) Observe(event connstats.Event) {
@@ -54,7 +55,24 @@ func (r *connectionEventRecorder) Observe(event connstats.Event) {
 	r.events = append(r.events, event)
 	if r.latest.State != connstats.StateClosed && event.Version > r.latest.Version {
 		r.latest = event
+		if event.State == connstats.StateClosed && r.terminal != nil {
+			close(r.terminal)
+		}
 	}
+}
+
+// The signal follows acceptance of the terminal snapshot. Transport context
+// cancellation happens earlier and is not an observation-delivery barrier.
+func (r *connectionEventRecorder) terminalSignal() <-chan struct{} {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.terminal == nil {
+		r.terminal = make(chan struct{})
+		if r.latest.State == connstats.StateClosed {
+			close(r.terminal)
+		}
+	}
+	return r.terminal
 }
 
 func (r *connectionEventRecorder) snapshot() (connstats.Event, []connstats.Event) {
@@ -120,6 +138,9 @@ func TestConnectionObservationFactoryConcurrentClose(t *testing.T) {
 		client.ActivateConnectionObserver()
 		close(activated)
 	}()
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() { unblock(); awaitConnectionSignal(t, activated) })
 	awaitConnectionSignal(t, entered)
 	// A repeated activation must not wait for the blocked factory.
 	repeated := make(chan struct{})
@@ -130,7 +151,7 @@ func TestConnectionObservationFactoryConcurrentClose(t *testing.T) {
 	client.observationTransitionLocked(connstats.StateClosed)
 	client.mu.Unlock()
 	client.publishConnectionObservation()
-	close(release)
+	unblock()
 	awaitConnectionSignal(t, activated)
 	latest, events := r.snapshot()
 	if calls.Load() != 1 || latest != (connstats.Event{Version: 3, State: connstats.StateClosed}) || len(events) != 1 {
@@ -151,12 +172,15 @@ func TestConnectionObservationOutOfOrderDelivery(t *testing.T) {
 		})
 	}), connstats.Meta{})}
 	go func() { client.ActivateConnectionObserver(); close(activated) }()
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() { unblock(); awaitConnectionSignal(t, activated) })
 	awaitConnectionSignal(t, entered)
 	client.mu.Lock()
 	client.observationTransitionLocked(connstats.StateClosed)
 	client.mu.Unlock()
 	client.publishConnectionObservation()
-	close(release)
+	unblock()
 	awaitConnectionSignal(t, activated)
 	latest, events := r.snapshot()
 	if latest.State != connstats.StateClosed || len(events) != 2 || events[0].Version != 2 || events[1].Version != 1 {
@@ -299,6 +323,9 @@ func TestConnectionObserverBlockingTerminalAfterCleanup(t *testing.T) {
 			})
 			client := newObservedTestTransport(t, r)
 			client.ActivateConnectionObserver()
+			var releaseOnce sync.Once
+			unblock := func() { releaseOnce.Do(func() { close(release) }) }
+			t.Cleanup(func() { unblock(); awaitConnectionSignal(t, done) })
 			go func() {
 				switch operation {
 				case "close":
@@ -316,7 +343,7 @@ func TestConnectionObserverBlockingTerminalAfterCleanup(t *testing.T) {
 			awaitConnectionSignal(t, client.ctx.Done())
 			awaitConnectionSignal(t, client.conn.(*connectionObserverTestConn).closed)
 			awaitConnectionSignal(t, client.readerDone)
-			close(release)
+			unblock()
 			awaitConnectionSignal(t, done)
 		})
 	}
@@ -331,6 +358,8 @@ func TestConnectionObserverBlockingGoAwayAfterStreamCleanup(t *testing.T) {
 		}
 	}))
 	client.ActivateConnectionObserver()
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
 	first, err := client.NewStream(context.Background(), &CallHdr{Method: "/service/method"})
 	if err != nil {
 		t.Fatal(err)
@@ -339,6 +368,8 @@ func TestConnectionObserverBlockingGoAwayAfterStreamCleanup(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// This runs before the transport cleanup registered by the helper.
+	t.Cleanup(func() { unblock(); awaitConnectionSignal(t, done) })
 	go func() {
 		client.handleGoAway(&grpcframe.GoAwayFrame{LastStreamID: first.id})
 		close(done)
@@ -348,7 +379,7 @@ func TestConnectionObserverBlockingGoAwayAfterStreamCleanup(t *testing.T) {
 	if !second.Unprocessed() {
 		t.Error("GOAWAY rejected stream must be marked unprocessed before observation")
 	}
-	close(release)
+	unblock()
 	awaitConnectionSignal(t, done)
 	client.CloseStream(first, nil)
 }
@@ -368,6 +399,7 @@ func TestConnectionObserverTransportGracefulClose(t *testing.T) {
 		t.Fatalf("with active stream: %v", latest)
 	}
 	client.CloseStream(stream, nil)
+	awaitConnectionSignal(t, r.terminalSignal())
 	awaitConnectionSignal(t, client.ctx.Done())
 	awaitConnectionSignal(t, client.readerDone)
 	latest, events := r.snapshot()
@@ -400,6 +432,7 @@ func TestConnectionObserverTransportGoAway(t *testing.T) {
 				client.CloseStream(stream, nil)
 			}
 			awaitConnectionSignal(t, client.ctx.Done())
+			awaitConnectionSignal(t, r.terminalSignal())
 			client.Close(ErrConnClosing)
 			client.GracefulClose()
 			latest, _ := r.snapshot()
@@ -496,11 +529,20 @@ func TestConnectionObserverTransportCloseDuringFactory(t *testing.T) {
 	}
 	client := tr.(*http2Client)
 	go func() { client.ActivateConnectionObserver(); close(activated) }()
+	var releaseOnce sync.Once
+	unblock := func() { releaseOnce.Do(func() { close(release) }) }
+	t.Cleanup(func() {
+		unblock()
+		client.Close(ErrConnClosing)
+		awaitConnectionSignal(t, activated)
+		awaitConnectionSignal(t, client.readerDone)
+		awaitConnectionSignal(t, client.writerDone)
+	})
 	awaitConnectionSignal(t, entered)
 	closed := make(chan struct{})
 	go func() { client.Close(ErrConnClosing); close(closed) }()
 	awaitConnectionSignal(t, closed)
-	close(release)
+	unblock()
 	awaitConnectionSignal(t, activated)
 	latest, events := r.snapshot()
 	if latest != (connstats.Event{Version: 2, State: connstats.StateClosed}) || len(events) != 1 {
